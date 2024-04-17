@@ -14,10 +14,11 @@
 
 package main
 
-import (
-	"github.com/intel/ipu-opi-plugins/ipu-plugin/ipuplugin/cmd"
-)
+import "github.com/intel/ipu-opi-plugins/ipu-plugin/pkg/ipuplugin"
+
+// "github.com/intel/ipu-opi-plugins/ipu-plugin/ipuplugin/cmd"
 
 func main() {
-	cmd.Execute()
+	// cmd.Execute()
+	ipuplugin.SshFunc()
 }

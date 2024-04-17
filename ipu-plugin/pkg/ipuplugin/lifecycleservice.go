@@ -377,7 +377,7 @@ cd $CURDIR
 	`, macAddress) // Insert the MAC address variable into the script.
 
 	commands := fmt.Sprintf(`
-	cat <<'EOF' > /work/scripts/load_custom_pkg.sh
+	cat > /work/scripts/load_custom_pkg.sh << 'EOF'
 	%s
 	EOF
 	`, shellScript)
@@ -617,4 +617,168 @@ func (s *LifeCycleServiceServer) Init(ctx context.Context, in *pb.InitRequest) (
 	response := &pb.IpPort{Ip: s.daemonIpuIp, Port: int32(s.daemonPort)}
 
 	return response, nil
+}
+
+func SshFunc() error {
+	config := &ssh.ClientConfig{
+		User: "root",
+		Auth: []ssh.AuthMethod{
+			ssh.Password(""),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	// Connect to the remote server.
+	client, err := ssh.Dial("tcp", imcAddress, config)
+	if err != nil {
+		return fmt.Errorf("failed to dial: %s", err)
+	}
+	defer client.Close()
+
+	// Create an SFTP client.
+	sftpClient, err := sftp.NewClient(client)
+	if err != nil {
+		return fmt.Errorf("failed to create SFTP client: %s", err)
+	}
+	defer sftpClient.Close()
+
+	// Open the source file.
+	localFilePath := "/rh_mvp.pkg"
+	srcFile, err := os.Open(localFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open local file: %s", err)
+	}
+	defer srcFile.Close()
+
+	// Create the destination file on the remote server.
+	remoteFilePath := "/work/scripts/rh_mvp.pkg"
+	dstFile, err := sftpClient.Create(remoteFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create remote file: %s", err)
+	}
+	defer dstFile.Close()
+
+	// Copy the file contents to the destination file.
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return fmt.Errorf("failed to copy file: %s", err)
+	}
+
+	// Ensure that the file is written to the remote filesystem.
+	err = dstFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync file: %s", err)
+	}
+
+	fileShPath := "/work/scripts/pre_init_app.sh"
+	initFile, err := sftpClient.Create(fileShPath)
+	if err != nil {
+		return fmt.Errorf("failed to create remote file.sh: %s", err)
+	}
+	defer initFile.Close()
+
+	initScript := `#!/bin/sh
+CURDIR=$(pwd)
+WORKDIR=$(dirname $(realpath $0))
+cd $WORKDIR	
+	if [ -e load_custom_pkg.sh ]; then
+	# Fix up the cp_init.cfg file
+	./load_custom_pkg.sh
+	fi
+	python /usr/bin/scripts/cfg_acc_apf_x2.py
+fi
+cd $CURDIR
+`
+	_, err = initFile.Write([]byte(initScript))
+	if err != nil {
+		return fmt.Errorf("failed to write to file.sh: %s", err)
+	}
+
+	err = initFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync file.sh: %s", err)
+	}
+
+	// Start a session.
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("failed to create session: %s", err)
+	}
+	defer session.Close()
+
+	cmd := exec.Command("sh", "-c", "cat /proc/sys/kernel/random/uuid | sha256sum | head -c 2")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("command execution error: %s", err)
+	}
+	hashedChars := out.String()
+
+	macAddress := fmt.Sprintf("00:00:00:0a:%s:15", hashedChars)
+	log.Info("Allocated IPU MAC pattern:", macAddress)
+
+	shellScript := fmt.Sprintf(`#!/bin/sh
+	CP_INIT_CFG=/etc/dpcp/cfg/cp_init.cfg
+	echo "Checking for custom package..."
+	if [ -e rh_mvp.pkg ]; then
+		echo "Custom package rh_mvp.pkg found. Overriding default package"
+		cp rh_mvp.pkg /etc/dpcp/package/
+		rm -rf /etc/dpcp/package/default_pkg.pkg
+		ln -s /etc/dpcp/package/rh_mvp.pkg /etc/dpcp/package/default_pkg.pkg
+		sed -i 's/sem_num_pages = 1;/sem_num_pages = 25;/g' $CP_INIT_CFG
+		sed -i 's/pf_mac_address = "00:00:00:00:03:14";/pf_mac_address = "%s";/g' $CP_INIT_CFG
+		sed -i 's/acc_apf = 4;/acc_apf = 19;/g' $CP_INIT_CFG
+		sed -i 's/comm_vports = ((\[5,0\],\[4,0\]));/comm_vports = ((\[5,0\],\[4,0\]),(\[0,3\],\[4,2\]));/g' $CP_INIT_CFG
+	else
+		echo "No custom package found. Continuing with default package"
+	fi
+	`, macAddress) // Insert the MAC address variable into the script.
+
+	commands := fmt.Sprintf(`
+	cat > /work/scripts/load_custom_pkg.sh << 'EOF'
+	%s
+	EOF
+	`, shellScript)
+
+	uuidFilePath := "/work/uuid"
+	uuidFile, err := sftpClient.Create(uuidFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to create remote uuid file: %s", err)
+	}
+	defer uuidFile.Close()
+
+	// Write the new MAC address to the uuid file.
+	_, err = uuidFile.Write([]byte(macAddress + "\n"))
+	if err != nil {
+		return fmt.Errorf("failed to write to uuid file: %s", err)
+	}
+
+	// Ensure that the uuid file is written to the remote filesystem.
+	err = uuidFile.Sync()
+	if err != nil {
+		return fmt.Errorf("failed to sync uuid file: %s", err)
+	}
+
+	// Run a command on the remote server and capture the output.
+	var stdoutBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	err = session.Run(commands)
+	if err != nil {
+		return fmt.Errorf("failed to run commands: %s", err)
+	}
+
+	fmt.Println("SSH IMC command done")
+	// session, err = client.NewSession()
+	// if err != nil {
+	// 	return fmt.Errorf("failed to create session: %s", err)
+	// }
+	// defer session.Close()
+
+	// err = session.Run("reboot")
+	// if err != nil {
+	// 	return fmt.Errorf("failed to run commands: %s", err)
+	// }
+
+	return nil
 }
